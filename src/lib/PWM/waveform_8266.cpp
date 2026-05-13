@@ -92,6 +92,14 @@ static void timer1Interrupt();
 extern "C" IRAM_ATTR int __wrap_stopWaveform(uint8_t pin) { return true; }
 extern "C" IRAM_ATTR bool __wrap__stopPWM(uint8_t pin) { return true; }
 
+static volatile int watchdogCounter = 0;
+
+void feedWaveform8266()
+{
+  watchdogCounter = 0;
+  MEMBARRIER();
+}
+
 static __attribute__((noinline)) void initTimer() {
   if (!wvfState.timerRunning) {
     timer1_disable();
@@ -212,6 +220,9 @@ static IRAM_ATTR void timer1Interrupt() {
   T1C = 0;
   T1I = 0;
   int32_t cycleDeltaNextEvent = MAXINTERVAL_CS;
+
+  if (watchdogCounter == 20) return;    // 400Hz servos at 50Hz packet rate = 8 ticks, so 20 should be fine
+  watchdogCounter++;
 
   if (wvfState.waveformToEnable || wvfState.waveformToDisable) {
     // Handle enable/disable requests from main app

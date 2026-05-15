@@ -92,12 +92,21 @@ static void timer1Interrupt();
 extern "C" IRAM_ATTR int __wrap_stopWaveform(uint8_t pin) { return true; }
 extern "C" IRAM_ATTR bool __wrap__stopPWM(uint8_t pin) { return true; }
 
-static volatile int watchdogCounter = 0;
+static constexpr uint32_t WATCHDOG_TIMEOUT_US = 50000;
+static constexpr uint32_t WATCHDOG_TIMEOUT_CYCLES = microsecondsToClockCycles(WATCHDOG_TIMEOUT_US);
+
+static volatile uint32_t watchdogLastFeedCycle = 0;
+static volatile bool watchdogArmed = false;
 
 void feedWaveform8266()
 {
-  watchdogCounter = 0;
+  watchdogLastFeedCycle = ESP.getCycleCount();
+  watchdogArmed = true;
   MEMBARRIER();
+}
+
+static inline void armWaveformWatchdog() {
+  feedWaveform8266();
 }
 
 static __attribute__((noinline)) void initTimer() {
@@ -141,6 +150,7 @@ void startWaveform8266(uint8_t gpio, uint32_t timeHighUS, uint32_t timeLowUS) {
   MEMBARRIER();
   if (wvfState.waveformEnabled & mask) {
     wave->nextHighLowUs = (timeHighUS << 16) | timeLowUS;
+    armWaveformWatchdog();
     MEMBARRIER();
     // The waveform will be updated some time in the future on the next period for the signal
   } else { //  if (!(wvfState.waveformEnabled & mask)) {
@@ -149,6 +159,7 @@ void startWaveform8266(uint8_t gpio, uint32_t timeHighUS, uint32_t timeLowUS) {
     wave->nextHighLowUs = 0;
     wave->nextServiceCycle = ESP.getCycleCount() + microsecondsToClockCycles(1);
     wvfState.waveformToEnable |= mask;
+    armWaveformWatchdog();
     MEMBARRIER();
     initTimer();
     forceTimerInterrupt();
@@ -199,6 +210,37 @@ static inline IRAM_ATTR uint32_t earliest(uint32_t a, uint32_t b) {
     return (da < db) ? a : b;
 }
 
+static inline IRAM_ATTR bool watchdogExpired(uint32_t now) {
+  if (!watchdogArmed) {
+    return false;
+  }
+
+  return static_cast<int32_t>(now - watchdogLastFeedCycle) >= static_cast<int32_t>(WATCHDOG_TIMEOUT_CYCLES);
+}
+
+static inline IRAM_ATTR void stopAllWaveformsFromWatchdog() {
+  const uint32_t enabled = wvfState.waveformEnabled;
+  if (!enabled) {
+    watchdogArmed = false;
+    wvfState.timerRunning = false;
+    return;
+  }
+
+  GPOC = enabled & 0xffff;
+  if (enabled & (1 << 16)) {
+    GP16O = 0;
+  }
+
+  wvfState.waveformState &= ~enabled;
+  wvfState.waveformEnabled = 0;
+  wvfState.waveformToEnable = 0;
+  wvfState.waveformToDisable = 0;
+  wvfState.startPin = 0;
+  wvfState.endPin = 0;
+  watchdogArmed = false;
+  wvfState.timerRunning = false;
+}
+
 #if F_CPU == 80000000
 #define adjust(x) ((x) << (turbo ? 1 : 0))
 #else
@@ -221,8 +263,10 @@ static IRAM_ATTR void timer1Interrupt() {
   T1I = 0;
   int32_t cycleDeltaNextEvent = MAXINTERVAL_CS;
 
-  if (watchdogCounter == 20) return;    // 400Hz servos at 50Hz packet rate = 8 ticks, so 20 should be fine
-  watchdogCounter++;
+  if (watchdogExpired(GetCycleCountIRQ())) {
+    stopAllWaveformsFromWatchdog();
+    return;
+  }
 
   if (wvfState.waveformToEnable || wvfState.waveformToDisable) {
     // Handle enable/disable requests from main app
